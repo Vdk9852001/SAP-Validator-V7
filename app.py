@@ -12,6 +12,8 @@ import threading
 import time
 import json
 import io
+import html as html_lib
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime
 
@@ -54,6 +56,7 @@ DEFAULT_CONFIG = {
 }
 
 results_store = {}
+row_details_store = {}
 scan_status   = {
     "last_scan": None, "scanning": False, "error": None,
     "current_file": None, "total_files": 0, "completed_files": 0,
@@ -165,6 +168,24 @@ def find_corrected_files(target_file):
         "download_url": "/api/download-corrected/" + p.name,
         "created_at": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
     } for p in files[:10] if p.suffix.lower() in SUPPORTED_EXT]
+
+
+def cache_and_trim_row_details(result):
+    """Keep complete row details server-side while returning a small dashboard payload."""
+    object_name = str(result.get("name", "")).upper()
+    cached = {}
+    for field_row in result.get("field_results", []):
+        field_name = str(field_row.get("field", "")).upper()
+        cached[field_name] = {
+            "label": field_row.get("display_name") or field_row.get("field_label") or field_name,
+            "target_field": field_row.get("field_target") or field_name,
+            "matches": field_row.get("matches", []),
+            "mismatches": field_row.get("mismatches", []),
+        }
+        field_row["mismatch_count"] = len(field_row.get("mismatches", []))
+        field_row["mismatches"] = field_row.get("mismatches", [])[:20]
+        field_row.pop("matches", None)
+    row_details_store[object_name] = cached
 
 
 # ── Config helpers ──────────────────────────────────────────────────────────────
@@ -602,6 +623,7 @@ def run_validation(name, source_path, target_path):
             "pass_threshold":     fr.pass_threshold,
             "status":             fr.status,
             "mismatches":         fr.mismatch_details,
+            "matches":            fr.matched_details,
             "mismatch_count":     len(fr.mismatch_details),
         })
 
@@ -704,6 +726,7 @@ def run_validation(name, source_path, target_path):
         result_dict["excel_error"] = str(e)
         log_event(f"Excel failed for {name}: {e}", "error")
 
+    cache_and_trim_row_details(result_dict)
     return result_dict
     cfg            = load_config()
     pass_threshold = float(cfg.get("pass_threshold", 100.0))
@@ -912,6 +935,7 @@ def run_validation(name, source_path, target_path):
             "pass_threshold":     fr.pass_threshold,
             "status":             fr.status,
             "mismatches":         fr.mismatch_details,
+            "matches":            fr.matched_details,
             "mismatch_count":     len(fr.mismatch_details),
         })
 
@@ -1009,6 +1033,7 @@ def run_validation(name, source_path, target_path):
         result_dict["excel_error"] = str(e)
         log_event(f"Excel failed for {name}: {e}", "error")
 
+    cache_and_trim_row_details(result_dict)
     return result_dict
 
 
@@ -1181,6 +1206,86 @@ def api_results():
 def api_result_detail(name):
     r = results_store.get(name.upper())
     return jsonify(r) if r else (jsonify({"error": "Not found"}), 404)
+
+
+@app.route("/field-records/<name>/<path:field>")
+def field_records_page(name, field):
+    """Paginated matched-record drill-down opened by double-clicking a PASS field."""
+    details = row_details_store.get(name.upper(), {}).get(field.upper())
+    if not details:
+        return Response("Matched-record details are not available. Run validation again.", status=404)
+    rows = details.get("matches", [])
+    page_size = 500
+    try: page = max(1, int(request.args.get("page", 1)))
+    except ValueError: page = 1
+    pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(page, pages)
+    start = (page - 1) * page_size
+    visible = rows[start:start + page_size]
+    esc_html = lambda value: html_lib.escape(str(value if value is not None else ""))
+    body_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            esc_html(row.get("material", "")), esc_html(row.get("source_value", "")),
+            esc_html(row.get("target_value", "")), esc_html(row.get("result", "")))
+        for row in visible
+    )
+    base = f"/field-records/{quote(name, safe='')}/{quote(field, safe='')}"
+    nav = ""
+    if page > 1: nav += f'<a href="{base}?page={page-1}">Previous</a>'
+    nav += f"<span>Page {page} of {pages} · {len(rows):,} matched records</span>"
+    if page < pages: nav += f'<a href="{base}?page={page+1}">Next</a>'
+    document = f"""<!doctype html><html><head><meta charset="utf-8">
+    <title>Matched Records - {esc_html(details.get('label', field))}</title>
+    <style>body{{font:13px system-ui;margin:24px;background:#f4f6fa;color:#1a1f36}}
+    h1{{font-size:20px}}p{{color:#6b728e}}table{{width:100%;border-collapse:collapse;background:white}}
+    th{{background:#134e4a;color:white;text-align:left;padding:9px}}td{{padding:8px;border-bottom:1px solid #dde1ec}}
+    tr:nth-child(even){{background:#f0fdf4}}.nav{{display:flex;gap:16px;align-items:center;margin:16px 0}}
+    a{{color:#0f766e;font-weight:700}}</style></head><body>
+    <h1>{esc_html(details.get('label', field))} — Matched Records</h1>
+    <p>{esc_html(name)} · Source field {esc_html(field)} · Target field {esc_html(details.get('target_field', field))}</p>
+    <div class="nav">{nav}</div><table><thead><tr><th>Key</th><th>Source Value</th><th>Target Value</th><th>Result</th></tr></thead>
+    <tbody>{body_rows}</tbody></table><div class="nav">{nav}</div></body></html>"""
+    return Response(document, mimetype="text/html")
+
+
+@app.route("/field-errors/<name>/<path:field>")
+def field_errors_page(name, field):
+    """Paginated error drill-down opened by double-clicking a FAIL field."""
+    details = row_details_store.get(name.upper(), {}).get(field.upper())
+    if not details:
+        return Response("Error details are not available. Run validation again.", status=404)
+    rows = details.get("mismatches", [])
+    page_size = 500
+    try: page = max(1, int(request.args.get("page", 1)))
+    except ValueError: page = 1
+    pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(page, pages)
+    start = (page - 1) * page_size
+    visible = rows[start:start + page_size]
+    esc_html = lambda value: html_lib.escape(str(value if value is not None else ""))
+    body_rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            esc_html(row.get("material", "")), esc_html(row.get("source_value", "")),
+            esc_html(row.get("target_value", "")), esc_html(row.get("issue", "")))
+        for row in visible
+    )
+    base = f"/field-errors/{quote(name, safe='')}/{quote(field, safe='')}"
+    nav = ""
+    if page > 1: nav += f'<a href="{base}?page={page-1}">Previous</a>'
+    nav += f"<span>Page {page} of {pages} · {len(rows):,} error records</span>"
+    if page < pages: nav += f'<a href="{base}?page={page+1}">Next</a>'
+    document = f"""<!doctype html><html><head><meta charset="utf-8">
+    <title>Error Records - {esc_html(details.get('label', field))}</title>
+    <style>body{{font:13px system-ui;margin:24px;background:#fff7f6;color:#1a1f36}}
+    h1{{font-size:20px}}p{{color:#6b728e}}table{{width:100%;border-collapse:collapse;background:white}}
+    th{{background:#b42318;color:white;text-align:left;padding:9px}}td{{padding:8px;border-bottom:1px solid #f0d5d2}}
+    tr:nth-child(even){{background:#fff1f0}}.nav{{display:flex;gap:16px;align-items:center;margin:16px 0}}
+    a{{color:#b42318;font-weight:700}}</style></head><body>
+    <h1>{esc_html(details.get('label', field))} — Error Records</h1>
+    <p>{esc_html(name)} · Source field {esc_html(field)} · Target field {esc_html(details.get('target_field', field))}</p>
+    <div class="nav">{nav}</div><table><thead><tr><th>Key</th><th>Source Value</th><th>Target Value</th><th>Issue</th></tr></thead>
+    <tbody>{body_rows}</tbody></table><div class="nav">{nav}</div></body></html>"""
+    return Response(document, mimetype="text/html")
 
 
 @app.route("/api/activity")
@@ -2408,6 +2513,7 @@ def api_ltmc_validate():
             "pass_threshold":       fr.pass_threshold,
             "status":               fr.status,
             "mismatches":           fr.mismatch_details,
+            "matches":              fr.matched_details,
             "mismatch_count":       len(fr.mismatch_details),
         })
 
@@ -2451,6 +2557,8 @@ def api_ltmc_validate():
         generate_excel_report(result_dict, str(excel_path))
     except Exception as e:
         result_dict["excel_error"] = str(e)
+
+    cache_and_trim_row_details(result_dict)
 
     log_event(
         f"LTMC validation complete: {sheet_name} — "
